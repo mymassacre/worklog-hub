@@ -14,6 +14,13 @@ from worklog_hub.adapters.gitlab_catalog import GitLabCatalogCollector
 from worklog_hub.config import GitLabConfig
 
 
+def _connection(nodes: list[dict]) -> dict:
+    return {
+        "nodes": nodes,
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+    }
+
+
 class GitLabNormalizationTests(unittest.TestCase):
     def test_normalizes_timezone_and_preserves_actual_date(self) -> None:
         entry = normalize_timelog(gitlab_timelog())
@@ -28,6 +35,10 @@ class GitLabNormalizationTests(unittest.TestCase):
         cursors: list[str | None] = []
 
         def transport(query: str, variables: dict) -> dict:
+            if "WorklogHubTimelogGroups" in query:
+                return {"data": {"groups": _connection([])}}
+            if "WorklogHubTimelogProjects" in query:
+                return {"data": {"projects": _connection([{"id": "project-1"}])}}
             cursors.append(variables["after"])
             if variables["after"] is None:
                 return {
@@ -57,6 +68,10 @@ class GitLabNormalizationTests(unittest.TestCase):
         variables_seen: list[dict] = []
 
         def transport(query: str, variables: dict) -> dict:
+            if "WorklogHubTimelogGroups" in query:
+                return {"data": {"groups": _connection([])}}
+            if "WorklogHubTimelogProjects" in query:
+                return {"data": {"projects": _connection([{"id": "project-1"}])}}
             variables_seen.append(variables)
             return {
                 "data": {
@@ -73,6 +88,32 @@ class GitLabNormalizationTests(unittest.TestCase):
         )
         self.assertEqual(variables_seen[0]["startDate"], "2026-10-01")
         self.assertEqual(variables_seen[0]["endDate"], "2026-10-31")
+        self.assertEqual(variables_seen[0]["projectId"], "project-1")
+        self.assertIsNone(variables_seen[0]["groupId"])
+
+    def test_collects_scoped_timelogs_and_removes_duplicates(self) -> None:
+        scopes_seen: list[tuple[str | None, str | None]] = []
+
+        def transport(query: str, variables: dict) -> dict:
+            if "WorklogHubTimelogGroups" in query:
+                return {"data": {"groups": _connection([{"id": "group-1"}])}}
+            if "WorklogHubTimelogProjects" in query:
+                return {"data": {"projects": _connection([{"id": "project-1"}])}}
+            scopes_seen.append((variables["groupId"], variables["projectId"]))
+            return {"data": {"timelogs": _connection([gitlab_timelog("same")])}}
+
+        collector = GitLabCollector(
+            GitLabGraphQLClient(
+                GitLabConfig("https://gitlab.example", "secret"), transport
+            )
+        )
+        entries = collector.collect(date(2026, 10, 1), date(2026, 10, 31))
+
+        self.assertEqual([entry.external_id for entry in entries], ["same"])
+        self.assertEqual(
+            scopes_seen,
+            [("group-1", None), (None, "project-1")],
+        )
 
     def test_client_redacts_token_from_transport_error(self) -> None:
         token = "very-secret-token"

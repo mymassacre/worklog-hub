@@ -19,8 +19,21 @@ query WorklogHubCheck {
 """
 
 TIMELOGS_QUERY = """
-query WorklogHubTimelogs($startDate: Time!, $endDate: Time!, $after: String) {
-  timelogs(startDate: $startDate, endDate: $endDate, first: 100, after: $after) {
+query WorklogHubTimelogs(
+  $startDate: Time!
+  $endDate: Time!
+  $groupId: GroupID
+  $projectId: ProjectID
+  $after: String
+) {
+  timelogs(
+    startDate: $startDate
+    endDate: $endDate
+    groupId: $groupId
+    projectId: $projectId
+    first: 100
+    after: $after
+  ) {
     nodes {
       id
       spentAt
@@ -31,6 +44,24 @@ query WorklogHubTimelogs($startDate: Time!, $endDate: Time!, $after: String) {
       issue { id iid title webUrl }
       mergeRequest { id iid title webUrl sourceBranch }
     }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+TIMELOG_GROUPS_QUERY = """
+query WorklogHubTimelogGroups($after: String) {
+  groups(allAvailable: false, first: 100, after: $after) {
+    nodes { id }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+
+TIMELOG_PROJECTS_QUERY = """
+query WorklogHubTimelogProjects($after: String) {
+  projects(membership: true, first: 100, after: $after) {
+    nodes { id }
     pageInfo { hasNextPage endCursor }
   }
 }
@@ -143,6 +174,35 @@ class GitLabCollector:
     def collect(self, date_from: date, date_to: date) -> list[TimeEntry]:
         if date_from > date_to:
             raise ValueError("Начальная дата позже конечной")
+        scopes = [
+            ("groupId", external_id)
+            for external_id in self._collect_scope_ids(TIMELOG_GROUPS_QUERY, "groups")
+        ]
+        scopes.extend(
+            ("projectId", external_id)
+            for external_id in self._collect_scope_ids(
+                TIMELOG_PROJECTS_QUERY, "projects"
+            )
+        )
+        entries_by_id: dict[str, TimeEntry] = {}
+        for scope_name, scope_id in scopes:
+            for entry in self._collect_scope(
+                date_from,
+                date_to,
+                scope_name=scope_name,
+                scope_id=scope_id,
+            ):
+                entries_by_id[entry.external_id] = entry
+        return list(entries_by_id.values())
+
+    def _collect_scope(
+        self,
+        date_from: date,
+        date_to: date,
+        *,
+        scope_name: str,
+        scope_id: str,
+    ) -> list[TimeEntry]:
         cursor: str | None = None
         result: list[TimeEntry] = []
         seen_cursors: set[str] = set()
@@ -151,6 +211,8 @@ class GitLabCollector:
             variables = {
                 "startDate": date_from.isoformat(),
                 "endDate": date_to.isoformat(),
+                "groupId": scope_id if scope_name == "groupId" else None,
+                "projectId": scope_id if scope_name == "projectId" else None,
                 "after": cursor,
             }
             connection = self.client.execute(TIMELOGS_QUERY, variables).get("timelogs")
@@ -174,6 +236,39 @@ class GitLabCollector:
             seen_cursors.add(next_cursor)
             cursor = next_cursor
         return result
+
+    def _collect_scope_ids(self, query: str, connection_key: str) -> list[str]:
+        cursor: str | None = None
+        result: list[str] = []
+        seen_cursors: set[str] = set()
+        while True:
+            connection = self.client.execute(query, {"after": cursor}).get(
+                connection_key
+            )
+            if not isinstance(connection, dict):
+                raise GitLabError(f"В ответе отсутствует {connection_key}")
+            nodes = connection.get("nodes")
+            if not isinstance(nodes, list):
+                raise GitLabError(f"В ответе отсутствует {connection_key}.nodes")
+            result.extend(
+                str(node["id"])
+                for node in nodes
+                if isinstance(node, dict) and node.get("id")
+            )
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                return result
+            next_cursor = page_info.get("endCursor")
+            if (
+                not isinstance(next_cursor, str)
+                or not next_cursor
+                or next_cursor in seen_cursors
+            ):
+                raise GitLabError(
+                    f"GitLab вернул некорректный курсор для {connection_key}"
+                )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
 
 
 def normalize_timelog(raw: dict[str, Any]) -> TimeEntry:
