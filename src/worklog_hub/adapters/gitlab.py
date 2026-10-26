@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -41,6 +42,7 @@ class GitLabError(RuntimeError):
 
 
 Transport = Callable[[str, dict[str, Any]], dict[str, Any]]
+GRAPHQL_OPERATION_RE = re.compile(r"\b(?:query|mutation)\s+([_A-Za-z][_0-9A-Za-z]*)")
 
 
 class GitLabGraphQLClient:
@@ -53,6 +55,7 @@ class GitLabGraphQLClient:
     def execute(
         self, query: str, variables: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        operation = _operation_name(query)
         try:
             response = self._transport(query, variables or {})
         except GitLabError:
@@ -65,7 +68,8 @@ class GitLabGraphQLClient:
             rendered = "; ".join(str(item.get("message", item)) for item in errors)
             raise GitLabError(
                 redact_secrets(
-                    f"GitLab GraphQL вернул ошибку: {rendered}", (self.config.token,)
+                    f"GitLab GraphQL ({operation}) вернул ошибку: {rendered}",
+                    (self.config.token,),
                 )
             )
         data = response.get("data")
@@ -197,3 +201,8 @@ def normalize_timelog(raw: dict[str, Any]) -> TimeEntry:
 
 def _optional_string(value: Any) -> str | None:
     return None if value is None else str(value)
+
+
+def _operation_name(query: str) -> str:
+    match = GRAPHQL_OPERATION_RE.search(query)
+    return match.group(1) if match else "anonymous"

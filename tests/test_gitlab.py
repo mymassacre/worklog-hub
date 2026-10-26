@@ -88,6 +88,17 @@ class GitLabNormalizationTests(unittest.TestCase):
         self.assertNotIn(token, str(caught.exception))
         self.assertIn("***", str(caught.exception))
 
+    def test_client_reports_graphql_operation_name(self) -> None:
+        def transport(query: str, variables: dict) -> dict:
+            return {"errors": [{"message": "Access denied"}]}
+
+        client = GitLabGraphQLClient(
+            GitLabConfig("https://gitlab.example", "secret"), transport
+        )
+        with self.assertRaises(GitLabError) as caught:
+            client.execute("query WorklogHubGroups { groups { nodes { id } } }")
+        self.assertIn("WorklogHubGroups", str(caught.exception))
+
     def test_catalog_groups_are_paginated(self) -> None:
         cursors: list[str | None] = []
 
