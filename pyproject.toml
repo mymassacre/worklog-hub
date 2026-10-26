@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "worklog-hub"
+version = "0.1.0"
+description = "Сбор и унификация фактически списанного рабочего времени"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "ruff>=0.9,<1",
+]
+
+[project.scripts]
+worklog-hub = "worklog_hub.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+worklog_hub = ["migrations/*.sql"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+extend-exclude = [".uv-cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+# Пользовательские сообщения намеренно написаны кириллицей.
+ignore = ["RUF001"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
