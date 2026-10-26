@@ -14,6 +14,7 @@ class SyncResult:
     fetched: int
     deleted: int
     catalog_counts: dict[str, int]
+    warnings: list[str]
 
 
 def synchronize(
@@ -52,6 +53,7 @@ def synchronize(
             fetched=len(entries),
             deleted=deleted,
             catalog_counts=catalog_counts,
+            warnings=snapshot.warnings if snapshot is not None else [],
         )
     except Exception as exc:
         safe_message = redact_secrets(str(exc), secrets)

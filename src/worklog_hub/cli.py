@@ -68,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
                 for name, count in sorted(result.catalog_counts.items())
             )
             print(f"Каталог GitLab: {counts}")
+        for warning in result.warnings:
+            print(f"Предупреждение: {warning}", file=sys.stderr)
         return 0
     except (ConfigurationError, ValueError, RuntimeError) as exc:
         secrets: tuple[str, ...] = ()
@@ -92,4 +94,6 @@ def _print_status(database: Database) -> None:
             details += f" error={row['error_message']}"
         if row["catalog_counts_json"]:
             details += f" catalog={row['catalog_counts_json']}"
+        if row["warnings_json"]:
+            details += f" warnings={row['warnings_json']}"
         print(details)

@@ -178,7 +178,16 @@ class SyncTests(unittest.TestCase):
             FakeCollector([]),
             *period,
             catalog_collector=FakeCatalogCollector(
-                CatalogSnapshot([], [], [], [], [], [])
+                CatalogSnapshot(
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    warnings=["Нет доступа к участникам"],
+                    incomplete_tables={"memberships", "users"},
+                )
             ),
         )
 
@@ -192,8 +201,16 @@ class SyncTests(unittest.TestCase):
             jira_key = connection.execute(
                 "SELECT right_external_key FROM entity_links"
             ).fetchone()[0]
+            membership_active = connection.execute(
+                "SELECT is_active FROM memberships WHERE external_id='member-1'"
+            ).fetchone()[0]
+            warnings_json = connection.execute(
+                "SELECT warnings_json FROM sync_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
         self.assertEqual(result.catalog_counts["groups"], 1)
         self.assertEqual(active, 0)
+        self.assertEqual(membership_active, 1)
+        self.assertIn("Нет доступа к участникам", warnings_json)
         self.assertEqual(task_kind, "task")
         self.assertEqual(jira_key, "ABC-123")
 

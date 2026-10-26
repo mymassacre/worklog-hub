@@ -1,8 +1,14 @@
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
-from worklog_hub.adapters.gitlab import GitLabError, GitLabGraphQLClient
+from worklog_hub.adapters.gitlab import (
+    GitLabError,
+    GitLabGraphQLClient,
+    GitLabGraphQLError,
+    GitLabResourceUnavailable,
+)
 from worklog_hub.domain import (
     CatalogBranch,
     CatalogGroup,
@@ -145,6 +151,8 @@ query WorklogHubProjectBranches($fullPath: ID!, $offset: Int!) {
 }
 """
 
+CatalogItem = TypeVar("CatalogItem")
+
 
 class GitLabCatalogCollector:
     source_name = "gitlab"
@@ -153,8 +161,22 @@ class GitLabCatalogCollector:
         self.client = client
 
     def collect_catalog(self) -> CatalogSnapshot:
-        groups = self.collect_groups()
-        projects = self.collect_projects()
+        warnings: list[str] = []
+        incomplete_tables: set[str] = set()
+        groups = self._collect_optional(
+            self.collect_groups,
+            "группы",
+            {"groups", "memberships", "users", "iterations", "work_items"},
+            warnings,
+            incomplete_tables,
+        )
+        projects = self._collect_optional(
+            self.collect_projects,
+            "проекты",
+            {"projects", "memberships", "users", "work_items", "branches"},
+            warnings,
+            incomplete_tables,
+        )
         memberships: list[CatalogMembership] = []
         work_items: list[CatalogWorkItem] = []
         branches: list[CatalogBranch] = []
@@ -162,80 +184,130 @@ class GitLabCatalogCollector:
 
         for group in groups:
             variables = {"fullPath": group.full_path}
+            member_nodes = self._collect_optional(
+                lambda variables=variables: self._connection_nodes(
+                    GROUP_MEMBERS_QUERY,
+                    "group",
+                    "groupMembers",
+                    variables,
+                ),
+                f"участники группы {group.full_path}",
+                {"memberships", "users"},
+                warnings,
+                incomplete_tables,
+            )
             memberships.extend(
                 self._normalize_memberships(
-                    self._connection_nodes(
-                        GROUP_MEMBERS_QUERY,
-                        "group",
-                        "groupMembers",
-                        variables,
-                    ),
+                    member_nodes,
                     "group",
                     group.external_id,
                 )
             )
+            iteration_nodes = self._collect_optional(
+                lambda variables=variables: self._connection_nodes(
+                    GROUP_ITERATIONS_QUERY,
+                    "group",
+                    "iterations",
+                    variables,
+                ),
+                f"итерации группы {group.full_path}",
+                {"iterations"},
+                warnings,
+                incomplete_tables,
+            )
             iterations.extend(
                 self._normalize_iterations(
-                    self._connection_nodes(
-                        GROUP_ITERATIONS_QUERY,
-                        "group",
-                        "iterations",
-                        variables,
-                    ),
+                    iteration_nodes,
                     group.external_id,
                 )
             )
+            epic_nodes = self._collect_optional(
+                lambda variables=variables: self._connection_nodes(
+                    GROUP_EPICS_QUERY,
+                    "group",
+                    "workItems",
+                    variables,
+                ),
+                f"эпики группы {group.full_path}",
+                {"work_items"},
+                warnings,
+                incomplete_tables,
+            )
             work_items.extend(
                 self._normalize_epics(
-                    self._connection_nodes(
-                        GROUP_EPICS_QUERY,
-                        "group",
-                        "workItems",
-                        variables,
-                    ),
+                    epic_nodes,
                     group.external_id,
                 )
             )
 
         for project in projects:
             variables = {"fullPath": project.full_path}
+            member_nodes = self._collect_optional(
+                lambda variables=variables: self._connection_nodes(
+                    PROJECT_MEMBERS_QUERY,
+                    "project",
+                    "projectMembers",
+                    variables,
+                ),
+                f"участники проекта {project.full_path}",
+                {"memberships", "users"},
+                warnings,
+                incomplete_tables,
+            )
             memberships.extend(
                 self._normalize_memberships(
-                    self._connection_nodes(
-                        PROJECT_MEMBERS_QUERY,
-                        "project",
-                        "projectMembers",
-                        variables,
-                    ),
+                    member_nodes,
                     "project",
                     project.external_id,
                 )
             )
+            issue_nodes = self._collect_optional(
+                lambda variables=variables: self._connection_nodes(
+                    PROJECT_ISSUES_QUERY,
+                    "project",
+                    "issues",
+                    variables,
+                ),
+                f"задачи проекта {project.full_path}",
+                {"work_items"},
+                warnings,
+                incomplete_tables,
+            )
             work_items.extend(
                 self._normalize_project_items(
-                    self._connection_nodes(
-                        PROJECT_ISSUES_QUERY,
-                        "project",
-                        "issues",
-                        variables,
-                    ),
+                    issue_nodes,
                     project.external_id,
                     is_merge_request=False,
                 )
             )
+            merge_request_nodes = self._collect_optional(
+                lambda variables=variables: self._connection_nodes(
+                    PROJECT_MERGE_REQUESTS_QUERY,
+                    "project",
+                    "mergeRequests",
+                    variables,
+                ),
+                f"merge requests проекта {project.full_path}",
+                {"work_items"},
+                warnings,
+                incomplete_tables,
+            )
             work_items.extend(
                 self._normalize_project_items(
-                    self._connection_nodes(
-                        PROJECT_MERGE_REQUESTS_QUERY,
-                        "project",
-                        "mergeRequests",
-                        variables,
-                    ),
+                    merge_request_nodes,
                     project.external_id,
                     is_merge_request=True,
                 )
             )
-            branches.extend(self._collect_branches(project))
+            branches.extend(
+                self._collect_optional(
+                    lambda project=project: self._collect_branches(project),
+                    f"ветки проекта {project.full_path}",
+                    {"branches"},
+                    warnings,
+                    incomplete_tables,
+                )
+            )
 
         return CatalogSnapshot(
             groups=groups,
@@ -244,7 +316,28 @@ class GitLabCatalogCollector:
             work_items=work_items,
             branches=branches,
             iterations=iterations,
+            warnings=warnings,
+            incomplete_tables=incomplete_tables,
         )
+
+    @staticmethod
+    def _collect_optional(
+        collect: Callable[[], list[CatalogItem]],
+        label: str,
+        affected_tables: set[str],
+        warnings: list[str],
+        incomplete_tables: set[str],
+    ) -> list[CatalogItem]:
+        try:
+            return collect()
+        except GitLabGraphQLError as exc:
+            if not exc.catalog_resource_unavailable:
+                raise
+            warnings.append(f"Недоступны {label}: {exc}")
+        except GitLabResourceUnavailable as exc:
+            warnings.append(f"Недоступны {label}: {exc}")
+        incomplete_tables.update(affected_tables)
+        return []
 
     def collect_groups(self) -> list[CatalogGroup]:
         return [
@@ -292,7 +385,11 @@ class GitLabCatalogCollector:
             data = self.client.execute(query, page_variables)
             scope = data if scope_key is None else data.get(scope_key)
             if not isinstance(scope, dict):
-                raise GitLabError(f"В ответе отсутствует {scope_key}")
+                if scope_key is not None:
+                    raise GitLabResourceUnavailable(
+                        f"GitLab не вернул ресурс {scope_key}"
+                    )
+                raise GitLabError(f"В ответе отсутствует {connection_key}")
             connection = scope.get(connection_key)
             if not isinstance(connection, dict):
                 raise GitLabError(f"В ответе отсутствует {connection_key}")
@@ -320,7 +417,7 @@ class GitLabCatalogCollector:
             )
             project_data = data.get("project")
             if not isinstance(project_data, dict):
-                raise GitLabError("В ответе отсутствует project")
+                raise GitLabResourceUnavailable("GitLab не вернул ресурс project")
             repository = project_data.get("repository")
             if repository is None:
                 return result

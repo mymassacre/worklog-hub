@@ -231,11 +231,26 @@ class Database:
                     group_ids,
                     loaded_at,
                 )
-                self._deactivate_missing_catalog(connection, source_id, run_id)
+                self._deactivate_missing_catalog(
+                    connection,
+                    source_id,
+                    run_id,
+                    snapshot.incomplete_tables,
+                )
                 counts = snapshot.counts()
                 connection.execute(
-                    "UPDATE sync_runs SET catalog_counts_json=? WHERE id=?",
-                    (json.dumps(counts, sort_keys=True), run_id),
+                    """UPDATE sync_runs
+                       SET catalog_counts_json=?, warnings_json=?
+                       WHERE id=?""",
+                    (
+                        json.dumps(counts, sort_keys=True),
+                        (
+                            json.dumps(snapshot.warnings, ensure_ascii=False)
+                            if snapshot.warnings
+                            else None
+                        ),
+                        run_id,
+                    ),
                 )
                 connection.commit()
                 return counts
@@ -250,7 +265,7 @@ class Database:
                     """SELECT r.id, s.name AS source, r.started_at, r.finished_at,
                               r.date_from, r.date_to, r.status, r.fetched_count,
                               r.upserted_count, r.deleted_count, r.error_message,
-                              r.catalog_counts_json
+                              r.catalog_counts_json, r.warnings_json
                        FROM sync_runs r JOIN sources s ON s.id = r.source_id
                        ORDER BY r.id DESC LIMIT ?""",
                     (limit,),
@@ -681,7 +696,10 @@ class Database:
 
     @staticmethod
     def _deactivate_missing_catalog(
-        connection: sqlite3.Connection, source_id: int, run_id: int
+        connection: sqlite3.Connection,
+        source_id: int,
+        run_id: int,
+        incomplete_tables: set[str],
     ) -> None:
         for table in (
             "groups",
@@ -692,6 +710,8 @@ class Database:
             "branches",
             "iterations",
         ):
+            if table in incomplete_tables:
+                continue
             connection.execute(
                 f"""UPDATE {table} SET is_active=0
                     WHERE source_id=?

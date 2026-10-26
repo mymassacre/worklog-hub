@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Protocol
 
@@ -133,6 +133,8 @@ class CatalogSnapshot:
     work_items: list[CatalogWorkItem]
     branches: list[CatalogBranch]
     iterations: list[CatalogIteration]
+    warnings: list[str] = field(default_factory=list)
+    incomplete_tables: set[str] = field(default_factory=set)
 
     def counts(self) -> dict[str, int]:
         return {

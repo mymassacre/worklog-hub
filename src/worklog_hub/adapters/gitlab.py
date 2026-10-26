@@ -41,6 +41,32 @@ class GitLabError(RuntimeError):
     pass
 
 
+class GitLabGraphQLError(GitLabError):
+    def __init__(self, operation: str, message: str) -> None:
+        self.operation = operation
+        self.graphql_message = message
+        super().__init__(f"GitLab GraphQL ({operation}) вернул ошибку: {message}")
+
+    @property
+    def catalog_resource_unavailable(self) -> bool:
+        message = self.graphql_message.casefold()
+        return any(
+            marker in message
+            for marker in (
+                "does not exist or you don't have permission",
+                "access denied",
+                "not authorized",
+                "doesn't exist on type",
+                "unknown argument",
+                "is not defined by type",
+            )
+        )
+
+
+class GitLabResourceUnavailable(GitLabError):
+    pass
+
+
 Transport = Callable[[str, dict[str, Any]], dict[str, Any]]
 GRAPHQL_OPERATION_RE = re.compile(r"\b(?:query|mutation)\s+([_A-Za-z][_0-9A-Za-z]*)")
 
@@ -66,11 +92,9 @@ class GitLabGraphQLClient:
         errors = response.get("errors")
         if errors:
             rendered = "; ".join(str(item.get("message", item)) for item in errors)
-            raise GitLabError(
-                redact_secrets(
-                    f"GitLab GraphQL ({operation}) вернул ошибку: {rendered}",
-                    (self.config.token,),
-                )
+            raise GitLabGraphQLError(
+                operation,
+                redact_secrets(rendered, (self.config.token,)),
             )
         data = response.get("data")
         if not isinstance(data, dict):

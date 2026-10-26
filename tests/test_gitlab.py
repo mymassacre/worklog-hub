@@ -150,6 +150,18 @@ class GitLabNormalizationTests(unittest.TestCase):
         self.assertEqual(groups[1].parent_external_id, "group-1")
         self.assertEqual(cursors, [None, "next"])
 
+    def test_catalog_does_not_hide_network_errors(self) -> None:
+        def transport(query: str, variables: dict) -> dict:
+            raise OSError("network failed")
+
+        collector = GitLabCatalogCollector(
+            GitLabGraphQLClient(
+                GitLabConfig("https://gitlab.example", "secret"), transport
+            )
+        )
+        with self.assertRaisesRegex(GitLabError, "network failed"):
+            collector.collect_catalog()
+
     def test_catalog_collects_iterations_epics_tasks_mrs_and_branches(self) -> None:
         def connection(nodes: list[dict]) -> dict:
             return {
@@ -193,7 +205,17 @@ class GitLabNormalizationTests(unittest.TestCase):
                     }
                 }
             if "WorklogHubGroupMembers" in query:
-                return {"data": {"group": {"groupMembers": connection([])}}}
+                return {
+                    "errors": [
+                        {
+                            "message": (
+                                "The resource that you are attempting to access "
+                                "does not exist or you don't have permission to "
+                                "perform this action"
+                            )
+                        }
+                    ]
+                }
             if "WorklogHubGroupIterations" in query:
                 return {
                     "data": {
@@ -308,6 +330,10 @@ class GitLabNormalizationTests(unittest.TestCase):
         self.assertEqual(snapshot.counts()["groups"], 1)
         self.assertEqual(snapshot.counts()["projects"], 1)
         self.assertEqual(snapshot.counts()["iterations"], 1)
+        self.assertIn("memberships", snapshot.incomplete_tables)
+        self.assertIn("users", snapshot.incomplete_tables)
+        self.assertEqual(len(snapshot.warnings), 1)
+        self.assertIn("WorklogHubGroupMembers", snapshot.warnings[0])
         self.assertEqual(
             {item.kind for item in snapshot.work_items},
             {"epic", "task", "merge_request"},
