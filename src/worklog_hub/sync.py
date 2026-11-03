@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 
+from worklog_hub.config import GroupScope, ProjectScope
 from worklog_hub.database import Database
 from worklog_hub.domain import CatalogCollector, Collector
 from worklog_hub.security import redact_secrets
@@ -26,9 +27,13 @@ def synchronize(
     catalog_collector: CatalogCollector | None = None,
     source_url: str | None = None,
     secrets: tuple[str, ...] = (),
+    scope: GroupScope | ProjectScope | None = None,
+    reconcile_missing: bool | None = None,
 ) -> SyncResult:
     if date_from > date_to:
         raise ValueError("Начальная дата позже конечной")
+    if reconcile_missing is None:
+        reconcile_missing = getattr(collector, "reconcile_missing", True)
     database.migrate()
     source_id = database.ensure_source(collector.source_name, source_url)
     jira_source_id = database.ensure_source("jira")
@@ -43,10 +48,17 @@ def synchronize(
         catalog_counts: dict[str, int] = {}
         if snapshot is not None:
             catalog_counts = database.persist_catalog(
-                source_id, jira_source_id, run_id, snapshot
+                source_id, jira_source_id, run_id, snapshot, scope=scope
             )
         deleted = database.persist_entries(
-            source_id, jira_source_id, run_id, date_from, date_to, entries
+            source_id,
+            jira_source_id,
+            run_id,
+            date_from,
+            date_to,
+            entries,
+            scope=scope,
+            reconcile_missing=reconcile_missing,
         )
         return SyncResult(
             run_id=run_id,

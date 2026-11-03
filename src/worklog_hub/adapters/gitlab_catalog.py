@@ -21,23 +21,49 @@ from worklog_hub.domain import (
 )
 
 GROUPS_QUERY = """
-query WorklogHubGroups($after: String) {
-  groups(allAvailable: false, first: 100, after: $after) {
+query WorklogHubGroup($fullPath: ID!) {
+  group(fullPath: $fullPath) {
+    id name fullPath webUrl parent { id }
+  }
+}
+"""
+
+AVAILABLE_GROUPS_QUERY = """
+query WorklogHubAvailableGroups($after: String, $search: String) {
+  groups(allAvailable: true, search: $search, first: 100, after: $after) {
     nodes { id name fullPath webUrl parent { id } }
     pageInfo { hasNextPage endCursor }
   }
 }
 """
 
-PROJECTS_QUERY = """
-query WorklogHubProjects($after: String) {
-  projects(membership: true, first: 100, after: $after) {
-    nodes {
-      id name fullPath webUrl archived
-      namespace { id }
-      repository { rootRef }
-    }
+DESCENDANTS_QUERY = """
+query WorklogHubDescendantGroups($fullPath: ID!, $after: String) {
+  group(fullPath: $fullPath) {
+    descendantGroups(first: 100, after: $after) {
+    nodes { id name fullPath webUrl parent { id } }
     pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+PROJECTS_QUERY = """
+query WorklogHubGroupProjects($fullPath: ID!, $after: String) {
+  group(fullPath: $fullPath) {
+    projects(
+      includeSubgroups: false
+      includeArchived: true
+      first: 100
+      after: $after
+    ) {
+      nodes {
+        id name fullPath webUrl archived
+        namespace { id }
+        repository { rootRef }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
   }
 }
 """
@@ -159,24 +185,14 @@ class GitLabCatalogCollector:
 
     def __init__(self, client: GitLabGraphQLClient) -> None:
         self.client = client
+        self._groups: list[CatalogGroup] | None = None
+        self._projects: list[CatalogProject] | None = None
 
     def collect_catalog(self) -> CatalogSnapshot:
         warnings: list[str] = []
         incomplete_tables: set[str] = set()
-        groups = self._collect_optional(
-            self.collect_groups,
-            "группы",
-            {"groups", "memberships", "users", "iterations", "work_items"},
-            warnings,
-            incomplete_tables,
-        )
-        projects = self._collect_optional(
-            self.collect_projects,
-            "проекты",
-            {"projects", "memberships", "users", "work_items", "branches"},
-            warnings,
-            incomplete_tables,
-        )
+        groups = self.collect_groups()
+        projects = self.collect_projects()
         memberships: list[CatalogMembership] = []
         work_items: list[CatalogWorkItem] = []
         branches: list[CatalogBranch] = []
@@ -339,7 +355,42 @@ class GitLabCatalogCollector:
         incomplete_tables.update(affected_tables)
         return []
 
+    def list_available_groups(self, search: str | None = None) -> list[CatalogGroup]:
+        nodes = self._connection_nodes(
+            AVAILABLE_GROUPS_QUERY, None, "groups", {"search": search}
+        )
+        groups = self._normalize_groups(nodes)
+        return sorted(
+            {group.external_id: group for group in groups}.values(),
+            key=lambda group: group.full_path,
+        )
+
     def collect_groups(self) -> list[CatalogGroup]:
+        if self._groups is not None:
+            return self._groups
+        scope = self.client.config.scope
+        if not scope.paths:
+            raise GitLabError("Не заданы группы для синхронизации")
+        nodes: dict[str, dict[str, Any]] = {}
+        for path in scope.paths:
+            root = self.client.execute(GROUPS_QUERY, {"fullPath": path}).get("group")
+            if not isinstance(root, dict) or root.get("fullPath") != path:
+                raise GitLabError(f"Группа {path} не найдена или недоступна")
+            nodes[str(root["id"])] = root
+            if scope.include_subgroups:
+                for node in self._connection_nodes(
+                    DESCENDANTS_QUERY, "group", "descendantGroups", {"fullPath": path}
+                ):
+                    if not str(node["fullPath"]).startswith(path + "/"):
+                        raise GitLabError(
+                            "GitLab вернул подгруппу вне выбранной группы"
+                        )
+                    nodes[str(node["id"])] = node
+        self._groups = self._normalize_groups(list(nodes.values()))
+        return self._groups
+
+    @staticmethod
+    def _normalize_groups(nodes: list[dict[str, Any]]) -> list[CatalogGroup]:
         return [
             CatalogGroup(
                 external_id=str(node["id"]),
@@ -349,12 +400,25 @@ class GitLabCatalogCollector:
                 parent_external_id=_nested_id(node.get("parent")),
                 raw=node,
             )
-            for node in self._connection_nodes(GROUPS_QUERY, None, "groups", {})
+            for node in nodes
         ]
 
     def collect_projects(self) -> list[CatalogProject]:
+        if self._projects is not None:
+            return self._projects
         projects: list[CatalogProject] = []
-        for node in self._connection_nodes(PROJECTS_QUERY, None, "projects", {}):
+        nodes: dict[str, dict[str, Any]] = {}
+        for group in self.collect_groups():
+            for node in self._connection_nodes(
+                PROJECTS_QUERY, "group", "projects", {"fullPath": group.full_path}
+            ):
+                # Shared-проекты другой группы не входят в выбранную иерархию.
+                if str(node["fullPath"]).rsplit("/", 1)[0] != group.full_path:
+                    continue
+                if _nested_id(node.get("namespace")) != group.external_id:
+                    raise GitLabError("GitLab вернул некорректную группу проекта")
+                nodes[str(node["id"])] = node
+        for node in nodes.values():
             repository = node.get("repository") or {}
             projects.append(
                 CatalogProject(
@@ -368,7 +432,8 @@ class GitLabCatalogCollector:
                     raw=node,
                 )
             )
-        return projects
+        self._projects = projects
+        return self._projects
 
     def _connection_nodes(
         self,

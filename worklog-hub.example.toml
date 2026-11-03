@@ -1,0 +1,18 @@
+# Скопируйте в worklog-hub.toml. Токены задаются командами gitlab/jira login.
+[database]
+# Относительный путь считается от каталога этого конфига.
+path = "worklog-hub.sqlite3"
+
+[gitlab]
+url = "https://gitlab.example.com"
+# Полные пути групп из URL, без адреса сервера и начального /.
+groups = ["company/team"]
+include_subgroups = true
+timeout_seconds = 30
+
+# Необязательно. Можно использовать только [jira], без [gitlab].
+# PAT задаётся отдельно командой jira login.
+# [jira]
+# url = "https://jira.example.com"
+# projects = ["ABC", "TEAM"]
+# timeout_seconds = 30

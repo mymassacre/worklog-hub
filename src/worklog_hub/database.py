@@ -9,10 +9,11 @@ from datetime import UTC, date, datetime
 from importlib.resources import files
 from pathlib import Path
 
+from worklog_hub.config import GroupScope, ProjectScope
 from worklog_hub.domain import CatalogSnapshot, TimeEntry
 
 JIRA_KEY_RE = re.compile(
-    r"(?<![A-Z0-9])([A-Z][A-Z0-9]+-\d+)(?![A-Z0-9])", re.IGNORECASE
+    r"(?<![A-Z0-9])([A-Z][A-Z0-9_]*-\d+)(?![A-Z0-9])", re.IGNORECASE
 )
 
 
@@ -56,6 +57,19 @@ class Database:
     def ensure_source(self, name: str, base_url: str | None = None) -> int:
         now = utc_now()
         with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT base_url FROM sources WHERE name=?", (name,)
+            ).fetchone()
+            if (
+                existing is not None
+                and existing["base_url"]
+                and base_url
+                and existing["base_url"].rstrip("/") != base_url.rstrip("/")
+            ):
+                raise ValueError(
+                    f"В SQLite уже сохранён другой сервер {name}; "
+                    "используйте отдельную БД"
+                )
             connection.execute(
                 """INSERT INTO sources(name, base_url, created_at, updated_at)
                    VALUES (?, ?, ?, ?)
@@ -104,6 +118,9 @@ class Database:
         date_from: date,
         date_to: date,
         entries: list[TimeEntry],
+        *,
+        scope: GroupScope | ProjectScope | None = None,
+        reconcile_missing: bool = True,
     ) -> int:
         loaded_at = utc_now()
         with self.connect() as connection:
@@ -145,7 +162,11 @@ class Database:
                             run_id,
                         ),
                     )
-                    if work_item_id is not None and entry.work_item is not None:
+                    if (
+                        source_id != jira_source_id
+                        and work_item_id is not None
+                        and entry.work_item is not None
+                    ):
                         self._upsert_jira_links(
                             connection,
                             work_item_id,
@@ -155,13 +176,24 @@ class Database:
                             loaded_at,
                         )
 
-                deleted = connection.execute(
-                    """DELETE FROM time_entries
+                scope_filter = ""
+                if scope is not None:
+                    self._prepare_scope(connection, source_id, scope)
+                    scope_filter = (
+                        " AND project_id IN (SELECT id FROM selected_projects)"
+                    )
+                deleted = (
+                    connection.execute(
+                        """DELETE FROM time_entries
                        WHERE source_id = ?
                          AND spent_date BETWEEN ? AND ?
-                         AND last_seen_run_id <> ?""",
-                    (source_id, date_from.isoformat(), date_to.isoformat(), run_id),
-                ).rowcount
+                         AND last_seen_run_id <> ?"""
+                        + scope_filter,
+                        (source_id, date_from.isoformat(), date_to.isoformat(), run_id),
+                    ).rowcount
+                    if reconcile_missing
+                    else 0
+                )
                 connection.execute(
                     """UPDATE sync_runs
                        SET status='success', finished_at=?, fetched_count=?,
@@ -181,6 +213,8 @@ class Database:
         jira_source_id: int,
         run_id: int,
         snapshot: CatalogSnapshot,
+        *,
+        scope: GroupScope | ProjectScope | None = None,
     ) -> dict[str, int]:
         loaded_at = utc_now()
         with self.connect() as connection:
@@ -236,6 +270,7 @@ class Database:
                     source_id,
                     run_id,
                     snapshot.incomplete_tables,
+                    scope,
                 )
                 counts = snapshot.counts()
                 connection.execute(
@@ -614,14 +649,15 @@ class Database:
                 "SELECT id FROM work_items WHERE source_id=? AND external_id=?",
                 (source_id, item.external_id),
             ).fetchone()[0]
-            Database._upsert_jira_links(
-                connection,
-                int(work_item_id),
-                jira_source_id,
-                item.title,
-                item.branch_name,
-                loaded_at,
-            )
+            if source_id != jira_source_id:
+                Database._upsert_jira_links(
+                    connection,
+                    int(work_item_id),
+                    jira_source_id,
+                    item.title,
+                    item.branch_name,
+                    loaded_at,
+                )
 
     @staticmethod
     def _persist_catalog_branches(
@@ -695,12 +731,52 @@ class Database:
             )
 
     @staticmethod
+    def _prepare_scope(
+        connection: sqlite3.Connection, source_id: int, scope: GroupScope | ProjectScope
+    ) -> None:
+        for table in ("groups", "projects"):
+            connection.execute(
+                f"CREATE TEMP TABLE selected_{table}(id INTEGER PRIMARY KEY)"
+            )
+            rows = connection.execute(
+                f"SELECT id, full_path FROM {table} WHERE source_id=?", (source_id,)
+            )
+            selected = []
+            for row in rows:
+                path = row["full_path"]
+                if not path:
+                    continue
+                if isinstance(scope, ProjectScope):
+                    included = table == "projects" and path in scope.keys
+                else:
+                    group_path = path if table == "groups" else path.rsplit("/", 1)[0]
+                    included = scope.contains(group_path)
+                if included:
+                    selected.append((row["id"],))
+            connection.executemany(
+                f"INSERT INTO selected_{table}(id) VALUES (?)", selected
+            )
+
+    @staticmethod
     def _deactivate_missing_catalog(
         connection: sqlite3.Connection,
         source_id: int,
         run_id: int,
         incomplete_tables: set[str],
+        scope: GroupScope | ProjectScope | None = None,
     ) -> None:
+        scoped_filters = {
+            "groups": "id IN (SELECT id FROM selected_groups)",
+            "projects": "id IN (SELECT id FROM selected_projects)",
+            "work_items": "(project_id IN (SELECT id FROM selected_projects) "
+            "OR group_id IN (SELECT id FROM selected_groups))",
+            "memberships": "(project_id IN (SELECT id FROM selected_projects) "
+            "OR group_id IN (SELECT id FROM selected_groups))",
+            "branches": "project_id IN (SELECT id FROM selected_projects)",
+            "iterations": "group_id IN (SELECT id FROM selected_groups)",
+        }
+        if scope is not None:
+            Database._prepare_scope(connection, source_id, scope)
         for table in (
             "groups",
             "projects",
@@ -712,11 +788,17 @@ class Database:
         ):
             if table in incomplete_tables:
                 continue
+            if scope is not None and table == "users":
+                # Пользователи общие для всех групп; отсутствие в выборке не
+                # доказывает, что пользователь исчез из GitLab.
+                continue
+            condition = "" if scope is None else f" AND {scoped_filters[table]}"
             connection.execute(
                 f"""UPDATE {table} SET is_active=0
                     WHERE source_id=?
                       AND last_seen_catalog_run_id IS NOT NULL
-                      AND last_seen_catalog_run_id<>?""",
+                      AND last_seen_catalog_run_id<>?"""
+                + condition,
                 (source_id, run_id),
             )
 

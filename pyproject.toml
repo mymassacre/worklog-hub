@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Сбор и унификация фактически списанного рабочего времени"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["keyring>=25.6,<26"]
 
 [dependency-groups]
 dev = [

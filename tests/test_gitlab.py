@@ -11,7 +11,7 @@ from worklog_hub.adapters.gitlab import (
     normalize_timelog,
 )
 from worklog_hub.adapters.gitlab_catalog import GitLabCatalogCollector
-from worklog_hub.config import GitLabConfig
+from worklog_hub.config import GitLabConfig, GroupScope
 
 
 def _connection(nodes: list[dict]) -> dict:
@@ -19,6 +19,45 @@ def _connection(nodes: list[dict]) -> dict:
         "nodes": nodes,
         "pageInfo": {"hasNextPage": False, "endCursor": None},
     }
+
+
+def _config() -> GitLabConfig:
+    return GitLabConfig(
+        "https://gitlab.example", "secret", scope=GroupScope(("group",), False)
+    )
+
+
+def _scope_response(query: str) -> dict | None:
+    if "WorklogHubGroup(" in query:
+        return {
+            "data": {
+                "group": {
+                    "id": "group-1",
+                    "name": "Group",
+                    "fullPath": "group",
+                    "webUrl": None,
+                    "parent": None,
+                }
+            }
+        }
+    if "WorklogHubGroupProjects" in query:
+        return {
+            "data": {
+                "group": {
+                    "projects": _connection(
+                        [
+                            {
+                                "id": "gid://gitlab/Project/2",
+                                "name": "Project",
+                                "fullPath": "group/project",
+                                "namespace": {"id": "group-1"},
+                            }
+                        ]
+                    )
+                }
+            }
+        }
+    return None
 
 
 class GitLabNormalizationTests(unittest.TestCase):
@@ -35,10 +74,8 @@ class GitLabNormalizationTests(unittest.TestCase):
         cursors: list[str | None] = []
 
         def transport(query: str, variables: dict) -> dict:
-            if "WorklogHubTimelogGroups" in query:
-                return {"data": {"groups": _connection([])}}
-            if "WorklogHubTimelogProjects" in query:
-                return {"data": {"projects": _connection([{"id": "project-1"}])}}
+            if (response := _scope_response(query)) is not None:
+                return response
             cursors.append(variables["after"])
             if variables["after"] is None:
                 return {
@@ -58,7 +95,7 @@ class GitLabNormalizationTests(unittest.TestCase):
                 }
             }
 
-        config = GitLabConfig("https://gitlab.example", "secret")
+        config = _config()
         collector = GitLabCollector(GitLabGraphQLClient(config, transport))
         entries = collector.collect(date(2026, 10, 1), date(2026, 10, 31))
         self.assertEqual([entry.external_id for entry in entries], ["one", "two"])
@@ -68,10 +105,8 @@ class GitLabNormalizationTests(unittest.TestCase):
         variables_seen: list[dict] = []
 
         def transport(query: str, variables: dict) -> dict:
-            if "WorklogHubTimelogGroups" in query:
-                return {"data": {"groups": _connection([])}}
-            if "WorklogHubTimelogProjects" in query:
-                return {"data": {"projects": _connection([{"id": "project-1"}])}}
+            if (response := _scope_response(query)) is not None:
+                return response
             variables_seen.append(variables)
             return {
                 "data": {
@@ -82,37 +117,31 @@ class GitLabNormalizationTests(unittest.TestCase):
                 }
             }
 
-        config = GitLabConfig("https://gitlab.example", "secret")
+        config = _config()
         GitLabCollector(GitLabGraphQLClient(config, transport)).collect(
             date(2026, 10, 1), date(2026, 10, 31)
         )
         self.assertEqual(variables_seen[0]["startDate"], "2026-10-01")
         self.assertEqual(variables_seen[0]["endDate"], "2026-10-31")
-        self.assertEqual(variables_seen[0]["projectId"], "project-1")
+        self.assertEqual(variables_seen[0]["projectId"], "gid://gitlab/Project/2")
         self.assertIsNone(variables_seen[0]["groupId"])
 
     def test_collects_scoped_timelogs_and_removes_duplicates(self) -> None:
         scopes_seen: list[tuple[str | None, str | None]] = []
 
         def transport(query: str, variables: dict) -> dict:
-            if "WorklogHubTimelogGroups" in query:
-                return {"data": {"groups": _connection([{"id": "group-1"}])}}
-            if "WorklogHubTimelogProjects" in query:
-                return {"data": {"projects": _connection([{"id": "project-1"}])}}
+            if (response := _scope_response(query)) is not None:
+                return response
             scopes_seen.append((variables["groupId"], variables["projectId"]))
             return {"data": {"timelogs": _connection([gitlab_timelog("same")])}}
 
-        collector = GitLabCollector(
-            GitLabGraphQLClient(
-                GitLabConfig("https://gitlab.example", "secret"), transport
-            )
-        )
+        collector = GitLabCollector(GitLabGraphQLClient(_config(), transport))
         entries = collector.collect(date(2026, 10, 1), date(2026, 10, 31))
 
         self.assertEqual([entry.external_id for entry in entries], ["same"])
         self.assertEqual(
             scopes_seen,
-            [("group-1", None), (None, "project-1")],
+            [(None, "gid://gitlab/Project/2")],
         )
 
     def test_client_redacts_token_from_transport_error(self) -> None:
@@ -144,62 +173,75 @@ class GitLabNormalizationTests(unittest.TestCase):
         cursors: list[str | None] = []
 
         def transport(query: str, variables: dict) -> dict:
+            if "WorklogHubGroup(" in query:
+                return {
+                    "data": {
+                        "group": {
+                            "id": "root",
+                            "name": "Root",
+                            "fullPath": "group",
+                            "parent": None,
+                        }
+                    }
+                }
             cursors.append(variables["after"])
             if variables["after"] is None:
                 return {
                     "data": {
-                        "groups": {
-                            "nodes": [
-                                {
-                                    "id": "group-1",
-                                    "name": "One",
-                                    "fullPath": "one",
-                                    "webUrl": "https://gitlab.example/one",
-                                    "parent": None,
-                                }
-                            ],
-                            "pageInfo": {
-                                "hasNextPage": True,
-                                "endCursor": "next",
-                            },
+                        "group": {
+                            "descendantGroups": {
+                                "nodes": [
+                                    {
+                                        "id": "group-1",
+                                        "name": "One",
+                                        "fullPath": "group/one",
+                                        "webUrl": "https://gitlab.example/one",
+                                        "parent": None,
+                                    }
+                                ],
+                                "pageInfo": {
+                                    "hasNextPage": True,
+                                    "endCursor": "next",
+                                },
+                            }
                         }
                     }
                 }
             return {
                 "data": {
-                    "groups": {
-                        "nodes": [
-                            {
-                                "id": "group-2",
-                                "name": "Two",
-                                "fullPath": "one/two",
-                                "webUrl": "https://gitlab.example/one/two",
-                                "parent": {"id": "group-1"},
-                            }
-                        ],
-                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "group": {
+                        "descendantGroups": {
+                            "nodes": [
+                                {
+                                    "id": "group-2",
+                                    "name": "Two",
+                                    "fullPath": "group/one/two",
+                                    "webUrl": "https://gitlab.example/one/two",
+                                    "parent": {"id": "group-1"},
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
                     }
                 }
             }
 
-        config = GitLabConfig("https://gitlab.example", "secret")
+        config = GitLabConfig(
+            "https://gitlab.example", "secret", scope=GroupScope(("group",))
+        )
         collector = GitLabCatalogCollector(GitLabGraphQLClient(config, transport))
         groups = collector.collect_groups()
         self.assertEqual(
-            [group.external_id for group in groups], ["group-1", "group-2"]
+            [group.external_id for group in groups], ["root", "group-1", "group-2"]
         )
-        self.assertEqual(groups[1].parent_external_id, "group-1")
+        self.assertEqual(groups[2].parent_external_id, "group-1")
         self.assertEqual(cursors, [None, "next"])
 
     def test_catalog_does_not_hide_network_errors(self) -> None:
         def transport(query: str, variables: dict) -> dict:
             raise OSError("network failed")
 
-        collector = GitLabCatalogCollector(
-            GitLabGraphQLClient(
-                GitLabConfig("https://gitlab.example", "secret"), transport
-            )
-        )
+        collector = GitLabCatalogCollector(GitLabGraphQLClient(_config(), transport))
         with self.assertRaisesRegex(GitLabError, "network failed"):
             collector.collect_catalog()
 
@@ -211,38 +253,36 @@ class GitLabNormalizationTests(unittest.TestCase):
             }
 
         def transport(query: str, variables: dict) -> dict:
-            if "WorklogHubGroups" in query:
+            if "WorklogHubGroup(" in query:
                 return {
                     "data": {
-                        "groups": connection(
-                            [
-                                {
-                                    "id": "group-1",
-                                    "name": "Group",
-                                    "fullPath": "group",
-                                    "webUrl": None,
-                                    "parent": None,
-                                }
-                            ]
-                        )
+                        "group": {
+                            "id": "group-1",
+                            "name": "Group",
+                            "fullPath": "group",
+                            "webUrl": None,
+                            "parent": None,
+                        }
                     }
                 }
-            if "WorklogHubProjects" in query:
+            if "WorklogHubGroupProjects" in query:
                 return {
                     "data": {
-                        "projects": connection(
-                            [
-                                {
-                                    "id": "project-1",
-                                    "name": "Project",
-                                    "fullPath": "group/project",
-                                    "webUrl": None,
-                                    "archived": False,
-                                    "namespace": {"id": "group-1"},
-                                    "repository": {"rootRef": "main"},
-                                }
-                            ]
-                        )
+                        "group": {
+                            "projects": connection(
+                                [
+                                    {
+                                        "id": "project-1",
+                                        "name": "Project",
+                                        "fullPath": "group/project",
+                                        "webUrl": None,
+                                        "archived": False,
+                                        "namespace": {"id": "group-1"},
+                                        "repository": {"rootRef": "main"},
+                                    }
+                                ]
+                            )
+                        }
                     }
                 }
             if "WorklogHubGroupMembers" in query:
@@ -363,7 +403,7 @@ class GitLabNormalizationTests(unittest.TestCase):
                 }
             self.fail(f"Неожиданный запрос: {query}")
 
-        config = GitLabConfig("https://gitlab.example", "secret")
+        config = _config()
         snapshot = GitLabCatalogCollector(
             GitLabGraphQLClient(config, transport)
         ).collect_catalog()

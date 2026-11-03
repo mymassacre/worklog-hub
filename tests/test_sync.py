@@ -9,6 +9,7 @@ from pathlib import Path
 
 from tests.helpers import gitlab_timelog
 from worklog_hub.adapters.gitlab import normalize_timelog
+from worklog_hub.config import GroupScope
 from worklog_hub.database import Database
 from worklog_hub.domain import (
     CatalogBranch,
@@ -107,6 +108,150 @@ class SyncTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(entry_count, 1)
         self.assertEqual(status, "failed")
+
+    def test_scoped_reconciliation_preserves_other_groups_and_subgroups(self) -> None:
+        entries = []
+        for name, path in (
+            ("selected", "team/app"),
+            ("child", "team/sub/app"),
+            ("similar", "team-other/app"),
+            ("other", "elsewhere/app"),
+        ):
+            raw = gitlab_timelog(name)
+            raw["project"]["id"] = name
+            raw["project"]["fullPath"] = path
+            entries.append(normalize_timelog(raw))
+        period = (date(2026, 10, 1), date(2026, 10, 31))
+        synchronize(self.database, FakeCollector(entries), *period)
+        result = synchronize(
+            self.database,
+            FakeCollector([]),
+            *period,
+            scope=GroupScope(("team",), False),
+        )
+        self.assertEqual(result.deleted, 1)
+        with self.database.connect() as connection:
+            ids = {
+                row[0]
+                for row in connection.execute("SELECT external_id FROM time_entries")
+            }
+        self.assertEqual(ids, {"child", "similar", "other"})
+        result = synchronize(
+            self.database,
+            FakeCollector([]),
+            *period,
+            scope=GroupScope(("team",), True),
+        )
+        self.assertEqual(result.deleted, 1)
+        with self.database.connect() as connection:
+            ids = {
+                row[0]
+                for row in connection.execute("SELECT external_id FROM time_entries")
+            }
+        self.assertEqual(ids, {"similar", "other"})
+
+    def test_scoped_catalog_deactivates_only_entities_inside_selected_groups(
+        self,
+    ) -> None:
+        snapshots = []
+        for path in ("team", "team/child", "team-other"):
+            group = CatalogGroup(path, path, path, None, None, {})
+            project = CatalogProject(
+                path, path, f"{path}/app", None, path, "main", False, {}
+            )
+            user = CatalogUser(path, path, path, None, {})
+            snapshots.append(
+                CatalogSnapshot(
+                    [group],
+                    [project],
+                    [
+                        CatalogMembership(
+                            path, "project", path, user, "DEVELOPER", 30, None, {}
+                        )
+                    ],
+                    [
+                        CatalogWorkItem(
+                            path,
+                            "issue",
+                            "1",
+                            "Task",
+                            None,
+                            "opened",
+                            None,
+                            path,
+                            None,
+                            None,
+                            None,
+                            None,
+                            {},
+                        )
+                    ],
+                    [CatalogBranch(path, "main", True)],
+                    [
+                        CatalogIteration(
+                            path,
+                            path,
+                            "1",
+                            "Sprint",
+                            None,
+                            "opened",
+                            None,
+                            None,
+                            None,
+                            {},
+                        )
+                    ],
+                )
+            )
+        combined = CatalogSnapshot(
+            groups=[item for snap in snapshots for item in snap.groups],
+            projects=[item for snap in snapshots for item in snap.projects],
+            memberships=[item for snap in snapshots for item in snap.memberships],
+            work_items=[item for snap in snapshots for item in snap.work_items],
+            branches=[item for snap in snapshots for item in snap.branches],
+            iterations=[item for snap in snapshots for item in snap.iterations],
+        )
+        period = (date(2026, 10, 1), date(2026, 10, 31))
+        synchronize(
+            self.database,
+            FakeCollector([]),
+            *period,
+            catalog_collector=FakeCatalogCollector(combined),
+        )
+        synchronize(
+            self.database,
+            FakeCollector([]),
+            *period,
+            catalog_collector=FakeCatalogCollector(
+                CatalogSnapshot([], [], [], [], [], [])
+            ),
+            scope=GroupScope(("team",), False),
+        )
+        with self.database.connect() as connection:
+            for table in (
+                "groups",
+                "projects",
+                "memberships",
+                "work_items",
+                "iterations",
+            ):
+                with self.subTest(table=table):
+                    states = {
+                        row[0]: row[1]
+                        for row in connection.execute(
+                            f"SELECT external_id, is_active FROM {table}"
+                        )
+                    }
+                    self.assertEqual(
+                        states, {"team": 0, "team/child": 1, "team-other": 1}
+                    )
+            self.assertEqual(
+                connection.execute("SELECT SUM(is_active) FROM users").fetchone()[0], 3
+            )
+            self.assertEqual(
+                connection.execute("SELECT SUM(is_active) FROM branches").fetchone()[0],
+                2,
+            )
 
     def test_catalog_is_upserted_and_missing_entities_are_deactivated(self) -> None:
         group = CatalogGroup("group-1", "Group", "group", None, None, {"id": "group-1"})

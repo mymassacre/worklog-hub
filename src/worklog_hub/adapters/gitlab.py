@@ -6,11 +6,14 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from worklog_hub.config import GitLabConfig
 from worklog_hub.domain import Person, Project, TimeEntry, WorkItem
 from worklog_hub.security import redact_secrets
+
+if TYPE_CHECKING:
+    from worklog_hub.adapters.gitlab_catalog import GitLabCatalogCollector
 
 CHECK_QUERY = """
 query WorklogHubCheck {
@@ -44,24 +47,6 @@ query WorklogHubTimelogs(
       issue { id iid title webUrl }
       mergeRequest { id iid title webUrl sourceBranch }
     }
-    pageInfo { hasNextPage endCursor }
-  }
-}
-"""
-
-TIMELOG_GROUPS_QUERY = """
-query WorklogHubTimelogGroups($after: String) {
-  groups(allAvailable: false, first: 100, after: $after) {
-    nodes { id }
-    pageInfo { hasNextPage endCursor }
-  }
-}
-"""
-
-TIMELOG_PROJECTS_QUERY = """
-query WorklogHubTimelogProjects($after: String) {
-  projects(membership: true, first: 100, after: $after) {
-    nodes { id }
     pageInfo { hasNextPage endCursor }
   }
 }
@@ -162,8 +147,13 @@ class GitLabGraphQLClient:
 class GitLabCollector:
     source_name = "gitlab"
 
-    def __init__(self, client: GitLabGraphQLClient) -> None:
+    def __init__(
+        self,
+        client: GitLabGraphQLClient,
+        catalog: GitLabCatalogCollector | None = None,
+    ) -> None:
         self.client = client
+        self.catalog = catalog
 
     def check(self) -> str:
         user = self.client.execute(CHECK_QUERY).get("currentUser")
@@ -174,24 +164,19 @@ class GitLabCollector:
     def collect(self, date_from: date, date_to: date) -> list[TimeEntry]:
         if date_from > date_to:
             raise ValueError("Начальная дата позже конечной")
-        scopes = [
-            ("groupId", external_id)
-            for external_id in self._collect_scope_ids(TIMELOG_GROUPS_QUERY, "groups")
-        ]
-        scopes.extend(
-            ("projectId", external_id)
-            for external_id in self._collect_scope_ids(
-                TIMELOG_PROJECTS_QUERY, "projects"
-            )
-        )
+        from worklog_hub.adapters.gitlab_catalog import GitLabCatalogCollector
+
+        catalog = self.catalog or GitLabCatalogCollector(self.client)
         entries_by_id: dict[str, TimeEntry] = {}
-        for scope_name, scope_id in scopes:
+        for project in catalog.collect_projects():
             for entry in self._collect_scope(
                 date_from,
                 date_to,
-                scope_name=scope_name,
-                scope_id=scope_id,
+                scope_name="projectId",
+                scope_id=project.external_id,
             ):
+                if entry.project.external_id != project.external_id:
+                    raise GitLabError("GitLab вернул timelog другого проекта")
                 entries_by_id[entry.external_id] = entry
         return list(entries_by_id.values())
 
@@ -236,39 +221,6 @@ class GitLabCollector:
             seen_cursors.add(next_cursor)
             cursor = next_cursor
         return result
-
-    def _collect_scope_ids(self, query: str, connection_key: str) -> list[str]:
-        cursor: str | None = None
-        result: list[str] = []
-        seen_cursors: set[str] = set()
-        while True:
-            connection = self.client.execute(query, {"after": cursor}).get(
-                connection_key
-            )
-            if not isinstance(connection, dict):
-                raise GitLabError(f"В ответе отсутствует {connection_key}")
-            nodes = connection.get("nodes")
-            if not isinstance(nodes, list):
-                raise GitLabError(f"В ответе отсутствует {connection_key}.nodes")
-            result.extend(
-                str(node["id"])
-                for node in nodes
-                if isinstance(node, dict) and node.get("id")
-            )
-            page_info = connection.get("pageInfo") or {}
-            if not page_info.get("hasNextPage"):
-                return result
-            next_cursor = page_info.get("endCursor")
-            if (
-                not isinstance(next_cursor, str)
-                or not next_cursor
-                or next_cursor in seen_cursors
-            ):
-                raise GitLabError(
-                    f"GitLab вернул некорректный курсор для {connection_key}"
-                )
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
 
 
 def normalize_timelog(raw: dict[str, Any]) -> TimeEntry:
